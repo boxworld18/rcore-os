@@ -14,8 +14,11 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::config::MAX_SYSCALL_NUM;
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{VirtAddr, VirtPageNum, MapPermission};
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_us;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
 use lazy_static::*;
@@ -79,6 +82,8 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let next_task = &mut inner.tasks[0];
         next_task.task_status = TaskStatus::Running;
+        next_task.start_time = get_time_us();
+        next_task.first_access = false;
         let next_task_cx_ptr = &next_task.task_cx as *const TaskContext;
         drop(inner);
         let mut _unused = TaskContext::zero_init();
@@ -140,6 +145,10 @@ impl TaskManager {
             let mut inner = self.inner.exclusive_access();
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
+            if inner.tasks[next].first_access {
+                inner.tasks[next].first_access = false;
+                inner.tasks[next].start_time = get_time_us();
+            }
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
@@ -152,6 +161,110 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+
+    /// Update syscall count of specific task
+    fn update_syscall_count(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let task_id = inner.current_task;
+        inner.tasks[task_id].syscall_count[syscall_id] += 1;
+    }
+
+    /// Get syscall count of specific task
+    fn get_syscall_count(&self) -> [u32; MAX_SYSCALL_NUM] {
+        let inner = self.inner.exclusive_access();
+        let task_id = inner.current_task;
+        inner.tasks[task_id].syscall_count.clone()
+    }
+
+    /// Get start time of specific task
+    fn get_start_time(&self) -> usize {
+        let inner = self.inner.exclusive_access();
+        let task_id = inner.current_task;
+        inner.tasks[task_id].start_time
+    }
+
+    // Memory map
+    fn mmap(&self, addr: usize, len: usize, port: usize) -> isize {
+        // trace!("=========");
+        // trace!{"mmap: addr: {:x}, len: {:x}, port: {:x}", addr, len, port};
+        // invalid port
+        if port & !0x7 != 0 || port & 0x7 == 0 {
+            return -1;
+        }
+        // invalid addr
+        if addr % 4096 != 0 {
+            return -1;
+        }
+        let mut inner = self.inner.exclusive_access();
+        let task_id = inner.current_task;
+        let memset = &mut inner.tasks[task_id].memory_set;
+
+        let st_va = VirtAddr::from(addr);
+        let ed_va = VirtAddr::from(addr + len);
+
+        let _st = st_va.floor();
+        let _ed = ed_va.ceil();
+        
+        // trace!("current task: {}", task_id);
+        // trace!("_st: {:x}, _ed: {:x}", _st.0, _ed.0);
+
+        for vpn in _st.0 .._ed.0 {
+            trace!{"allocate vpn: {:x}", vpn};
+            if let Some(_tmp) = memset.translate(VirtPageNum::from(vpn)) {
+                if _tmp.is_valid() {
+                    trace!("{:x} already mapped", vpn);
+                    return -1;
+                }
+            }
+        }
+
+        let mut per = MapPermission::from_bits_truncate((port as u8) << 1);
+        per.set(MapPermission::U, true);
+        
+        memset.insert_framed_area(st_va, ed_va, per);
+
+        // trace!("=========");
+
+        0
+    }
+
+    // Memory unmap
+    fn munmap(&self, addr: usize, len: usize) -> isize {
+        // trace!("=========");
+        // trace!{"munmap: addr: {:x}, len: {:x}", addr, len};
+        // invalid addr
+        if addr % 4096 != 0 {
+            return -1;
+        }
+        let mut inner = self.inner.exclusive_access();
+        let task_id = inner.current_task;
+        let memset = &mut inner.tasks[task_id].memory_set;
+
+        let st_va = VirtAddr::from(addr);
+        let ed_va = VirtAddr::from(addr + len);
+
+        let st = st_va.floor();
+        let ed = ed_va.ceil();
+
+        // trace!("current task: {}", task_id);
+        // trace!("_st: {:x}, _ed: {:x}", st.0, ed.0);
+
+        for vpn in st.0 ..ed.0 {
+            if let Some(_tmp) = memset.translate(VirtPageNum::from(vpn)) {
+                if !_tmp.is_valid() {
+                    return -1;
+                }
+            } else {
+                return -1;
+            }
+        }
+
+        for vpn in st.0 ..ed.0 {
+            memset.unmap(VirtPageNum::from(vpn));
+        }
+        // trace!("=========");
+        0
     }
 }
 
@@ -201,4 +314,29 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Update syscall count of specific task
+pub fn update_syscall_count(syscall_id: usize) {
+    TASK_MANAGER.update_syscall_count(syscall_id);
+}
+
+/// Get syscall count of specific task
+pub fn get_syscall_count() -> [u32; MAX_SYSCALL_NUM] {
+    TASK_MANAGER.get_syscall_count()
+}
+
+/// Get start time of specific task
+pub fn get_start_time() -> usize {
+    TASK_MANAGER.get_start_time()
+}
+
+/// Memory map
+pub fn mmap(_start: usize, _len: usize, _port: usize) -> isize {
+    TASK_MANAGER.mmap(_start, _len, _port)
+}
+
+/// Memory unmap
+pub fn munmap(_start: usize, _len: usize) -> isize {
+    TASK_MANAGER.munmap(_start, _len)
 }
