@@ -300,6 +300,22 @@ impl MemorySet {
             false
         }
     }
+
+    /// Unmap specific area
+    #[allow(unused)]
+    pub fn unmap(&mut self, vpn: VirtPageNum) -> bool {
+        if let Some(area) = self
+            .areas
+            .iter_mut()
+            .find(|area| area.vpn_range.get_start() == VirtAddr::from(vpn).floor())
+        {
+            area.unmap_one(&mut self.page_table, vpn);
+            true
+        } else {
+            false
+        }
+    }
+    
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {

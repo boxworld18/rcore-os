@@ -9,6 +9,8 @@ use super::{fetch_task, TaskStatus};
 use super::{TaskContext, TaskControlBlock};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
+use crate::config::{MAX_SYSCALL_NUM, BIG_STRIDE};
+use crate::mm::{VirtAddr, VirtPageNum, MapPermission};
 use alloc::sync::Arc;
 use lazy_static::*;
 
@@ -59,6 +61,7 @@ pub fn run_tasks() {
             let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
             // access coming task TCB exclusively
             let mut task_inner = task.inner_exclusive_access();
+            task_inner.stride += BIG_STRIDE / task_inner.priority;
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             task_inner.task_status = TaskStatus::Running;
             // release coming task_inner manually
@@ -108,4 +111,109 @@ pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
     unsafe {
         __switch(switched_task_cx_ptr, idle_task_cx_ptr);
     }
+}
+
+/// Update syscall count of specific task
+#[allow(unused)]
+pub fn update_syscall_count(syscall_id: usize) {
+    if let Some(task) = current_task() {
+        let mut inner = task.inner_exclusive_access();
+        inner.syscall_count[syscall_id] += 1;
+    }
+}
+
+/// Get syscall count of specific task
+#[allow(unused)]
+pub fn get_syscall_count() -> [u32; MAX_SYSCALL_NUM] {
+    if let Some(task) = current_task() {
+        let inner = task.inner_exclusive_access();
+        return inner.syscall_count
+    }
+    panic!("unreachable!")
+}
+
+/// Get start time of specific task
+#[allow(unused)]
+pub fn get_start_time() -> usize {
+    if let Some(task) = current_task() {
+        let inner = task.inner_exclusive_access();
+        return inner.start_time
+    }
+    panic!("unreachable!")
+}
+
+/// Memory map
+#[allow(unused)]
+pub fn mmap(addr: usize, len: usize, port: usize) -> isize {
+    if let Some(task) = current_task() {
+        if port & !0x7 != 0 || port & 0x7 == 0 {
+            return -1;
+        }
+        // invalid addr
+        if addr % 4096 != 0 {
+            return -1;
+        }
+
+        let mut inner = task.inner_exclusive_access();
+        let memset = &mut inner.memory_set;
+
+        let st_va = VirtAddr::from(addr);
+        let ed_va = VirtAddr::from(addr + len);
+
+        let _st = st_va.floor();
+        let _ed = ed_va.ceil();
+
+        for vpn in _st.0 .._ed.0 {
+            trace!{"allocate vpn: {:x}", vpn};
+            if let Some(_tmp) = memset.translate(VirtPageNum::from(vpn)) {
+                if _tmp.is_valid() {
+                    trace!("{:x} already mapped", vpn);
+                    return -1;
+                }
+            }
+        }
+
+        let mut per = MapPermission::from_bits_truncate((port as u8) << 1);
+        per.set(MapPermission::U, true);
+        
+        memset.insert_framed_area(st_va, ed_va, per);
+
+        return 0
+    }
+    panic!("unreachable!")
+}
+
+/// Memory unmap
+#[allow(unused)]
+pub fn munmap(addr: usize, len: usize) -> isize {
+    if let Some(task) = current_task() {
+        if addr % 4096 != 0 {
+            return -1;
+        }
+        let mut inner = task.inner_exclusive_access();
+        let memset = &mut inner.memory_set;
+
+        let st_va = VirtAddr::from(addr);
+        let ed_va = VirtAddr::from(addr + len);
+
+        let st = st_va.floor();
+        let ed = ed_va.ceil();
+
+        for vpn in st.0 ..ed.0 {
+            if let Some(_tmp) = memset.translate(VirtPageNum::from(vpn)) {
+                if !_tmp.is_valid() {
+                    return -1;
+                }
+            } else {
+                return -1;
+            }
+        }
+
+        for vpn in st.0 ..ed.0 {
+            memset.unmap(VirtPageNum::from(vpn));
+        }
+
+        return 0
+    }
+    panic!("unreachable!")
 }
