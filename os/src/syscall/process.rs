@@ -5,10 +5,13 @@ use alloc::sync::Arc;
 use crate::{
     config::MAX_SYSCALL_NUM,
     fs::{open_file, OpenFlags},
-    mm::{translated_refmut, translated_str},
+    timer::get_time_us,
+    mm::{translated_byte_buffer, translated_refmut, translated_str},
     task::{
-        add_task, current_task, current_user_token, exit_current_and_run_next,
-        suspend_current_and_run_next, TaskStatus,
+        add_task, current_task, current_user_token,
+        exit_current_and_run_next, suspend_current_and_run_next,
+        get_start_time, get_syscall_count, mmap, munmap,
+        TaskStatus,
     },
 };
 
@@ -114,26 +117,66 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     // ---- release current PCB automatically
 }
 
+pub fn memcpy(dst: &mut [u8], src: *const u8, len: usize) {
+    for i in 0..len {
+        unsafe {
+            dst[i] = src.add(i).read_volatile();
+        }
+    }
+}
+
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    trace!("kernel:pid[{}] sys_get_time", current_task().unwrap().pid.0);
+    let us = get_time_us();
+    let sec = us / 1_000_000;
+    let usec = us % 1_000_000;
+    let tv = TimeVal{sec, usec};
+
+    let buffers = translated_byte_buffer(current_user_token(), _ts as *const u8, core::mem::size_of::<TimeVal>());
+    let _cnt = 0;
+    let mut src = &tv as *const TimeVal as *const u8;
+
+    // copy data to user space
+    for buffer in buffers {
+        memcpy(buffer, src, buffer.len());
+        unsafe {
+            src = src.add(buffer.len());
+        }
+    }
+    0
 }
 
 /// YOUR JOB: Finish sys_task_info to pass testcases
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TaskInfo`] is splitted by two pages ?
 pub fn sys_task_info(_ti: *mut TaskInfo) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_task_info NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    trace!("kernel:pid[{}] sys_task_info", current_task().unwrap().pid.0);
+    let us = get_time_us();
+    let st = get_start_time();
+    let sec = (us - st) / 1_000_000;
+    let usec = (us - st) % 1_000_000;
+    let time = (sec & 0xffff) * 1000 + usec / 1000;
+
+    let ti = TaskInfo {
+        status: TaskStatus::Running,
+        syscall_times: get_syscall_count(),
+        time,
+    };
+
+    let buffers = translated_byte_buffer(current_user_token(), _ti as *const u8, core::mem::size_of::<TaskInfo>());
+    let mut src = &ti as *const TaskInfo as *const u8;
+
+    // copy data to user space
+    for buffer in buffers {
+        memcpy(buffer, src, buffer.len());
+        unsafe {
+            src = src.add(buffer.len());
+        }
+    }
+    0
 }
 
 /// YOUR JOB: Implement mmap.
@@ -142,7 +185,7 @@ pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
         "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    mmap(_start, _len, _port)
 }
 
 /// YOUR JOB: Implement munmap.
@@ -151,7 +194,7 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
         "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
         current_task().unwrap().pid.0
     );
-    -1
+    munmap(_start, _len)
 }
 
 /// change data segment size
@@ -167,18 +210,28 @@ pub fn sys_sbrk(size: i32) -> isize {
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
 pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    trace!("kernel:pid[{}] sys_spawn", current_task().unwrap().pid.0);
+    let current_task = current_task().unwrap();
+    let token = current_user_token();
+    let path = translated_str(token, _path);
+    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        let all_data = app_inode.read_all();
+        let new_task = current_task.spawn(all_data.as_slice());
+        let new_pid = new_task.pid.0;
+        add_task(new_task);
+        new_pid as isize
+    } else {
+        -1
+    }
 }
 
 // YOUR JOB: Set task priority.
 pub fn sys_set_priority(_prio: isize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    if _prio >= 2 {
+        let task = current_task().unwrap();
+        task.set_priority(_prio);
+        _prio
+    } else {
+        -1
+    }
 }
