@@ -197,3 +197,11 @@ pub fn remove_inactive_task(task: Arc<TaskControlBlock>) {
     trace!("kernel: remove_inactive_task .. remove_timer");
     remove_timer(Arc::clone(&task));
 }
+
+/// set deadlock detect
+pub fn enable_deadlock_detect(op: bool) -> isize {
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    process_inner.deadlock_detect = op;
+    0
+}
